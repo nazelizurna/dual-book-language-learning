@@ -1,3 +1,10 @@
+"""
+Build a bilingual "Ilya Frank method" EPUB from two EPUB editions of the same book.
+
+Usage:
+    python frank_epub.py french.epub russian.epub out.epub --orig-lang fr --trans-lang ru
+    python frank_epub.py            # auto mode: looks for english.epub / french.epub / russian.epub
+"""
 import argparse
 import html
 import os
@@ -24,6 +31,9 @@ def get_model():
     return _model
 
 
+# ----------------------------------------------------------------------------
+# 1. Text extraction
+# ----------------------------------------------------------------------------
 BLOCK_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6", "p", "li"]
 
 
@@ -59,6 +69,9 @@ def extract_blocks_from_epub(epub_path):
     return blocks
 
 
+# ----------------------------------------------------------------------------
+# 2. Sentence splitting (EN / FR / RU)
+# ----------------------------------------------------------------------------
 ABBREVIATIONS = {
     # English / French
     "mr", "mrs", "ms", "dr", "st", "prof", "mme", "mlle", "mm", "me", "no",
@@ -112,6 +125,9 @@ def blocks_to_sentences(blocks):
     return sentences
 
 
+# ----------------------------------------------------------------------------
+# 3. Monotonic alignment (banded dynamic programming)
+# ----------------------------------------------------------------------------
 def _normalize(a):
     n = np.linalg.norm(a, axis=1, keepdims=True)
     n[n == 0] = 1.0
@@ -207,6 +223,9 @@ def align(O, T, threshold=0.35, gap=0.25, band_frac=0.06, min_band=60):
     return pairs
 
 
+# ----------------------------------------------------------------------------
+# 4. EPUB writer
+# ----------------------------------------------------------------------------
 def build_epub(pairs, output_path, orig_lang, trans_lang, title):
     """
     pairs: list of (original_text, translation_text).
@@ -261,6 +280,9 @@ def build_epub(pairs, output_path, orig_lang, trans_lang, title):
     epub.write_epub(output_path, book)
 
 
+# ----------------------------------------------------------------------------
+# 5. Pipeline
+# ----------------------------------------------------------------------------
 def create_frank_epub(orig_epub, trans_epub, output_epub, orig_lang="en", trans_lang="ru"):
     print(f"\nAligning [{orig_lang.upper()}] {orig_epub}  ->  [{trans_lang.upper()}] {trans_epub}")
 
