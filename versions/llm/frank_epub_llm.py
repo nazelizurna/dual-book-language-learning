@@ -23,8 +23,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 _model = None
 
-# Bump this when the prompt/format changes so old cached answers are not reused.
-PROMPT_VERSION = "v3-comments"
+PROMPT_VERSION = "v4-languages"
 
 
 def get_model():
@@ -280,16 +279,16 @@ LEVELS = {
     "A2": {
         "desc": "elementary",
         "fragments": "very short fragments of 2 to 5 words",
-        "gloss": "every word or phrase beyond the 1000 most common words, all phrasal verbs, idioms and collocations",
+        "gloss": "every word or phrase beyond the 1000 most common words, and all idioms, collocations and fixed expressions",
         "max_words": 4,
-        "note": "give a note for almost every sentence that has any construction beyond simple present, simple past or simple future: perfect tenses, passive, modal verbs, participles, relative clauses, comparatives, infinitive constructions, word order",
+        "note": "give a note for almost every sentence that has any construction beyond the basic present, past and future",
     },
     "B1": {
         "desc": "intermediate",
         "fragments": "short fragments of 3 to 7 words",
-        "gloss": "words beyond roughly 3000 common words, phrasal verbs, idioms, collocations and figurative uses",
+        "gloss": "words beyond roughly the 3000 most common words, idioms, collocations, fixed expressions and figurative uses",
         "max_words": 3,
-        "note": "give a note only for non-trivial constructions: participle clauses, complex object, inversion, conditionals, reported speech, perfect modals, emphatic structures, tricky prepositions",
+        "note": "give a note only for non-trivial constructions",
     },
     "B2": {
         "desc": "upper-intermediate",
@@ -300,6 +299,57 @@ LEVELS = {
     },
 }
 
+GRAMMAR_TOPICS = {
+    "en": "perfect tenses, passive, modal verbs, participle clauses, complex object, inversion, conditionals, reported speech, phrasal verbs, tricky prepositions",
+    "fr": "passe simple and imparfait, subjonctif, pronouns (y, en, order of le/la/les), agreement of the past participle, negation (ne ... pas/jamais/que), gerondif, infinitive constructions, literary turns",
+    "ru": "verbal aspect, cases and prepositions, participles and gerunds, verbs of motion, reflexive verbs, clauses with chtoby, word order, impersonal sentences",
+    "de": "case and gender, word order in subordinate clauses, separable verbs, Konjunktiv, passive, modal particles",
+    "es": "subjuntivo, ser and estar, preterito and imperfecto, clitic pronouns, por and para",
+    "it": "congiuntivo, passato remoto, clitic pronouns, partitive, prepositions",
+}
+
+STOPWORDS = {
+    "en": set("the and of to a in that is was he she it for with as his her on be at by had not but they this from or have an are you i".split()),
+    "fr": set("le la les de des du un une et est que qui dans pour pas sur il elle au avec ce se ne son sa ses plus par mais on nous vous je tu ils elles etait ete".split()),
+    "de": set("der die das und ist nicht ein eine zu den mit von sich auf fur als auch es dem ich er sie war".split()),
+    "es": set("el la los las de que y en un una es por con no para su se al lo como mas pero".split()),
+    "it": set("il lo la i gli le di che e un una per non con si da come piu ma".split()),
+}
+
+
+def guess_language(sentences):
+    step = max(1, len(sentences) // 400)
+    text = " ".join(sentences[::step][:400])
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return None, {}
+    cyr = sum(1 for c in letters if "\u0400" <= c <= "\u04ff")
+    if cyr / len(letters) > 0.5:
+        return "ru", {"ru": 1.0}
+    tokens = re.findall(r"[^\W\d_]+", unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().casefold())
+    if not tokens:
+        return None, {}
+    scores = {l: sum(1 for t in tokens if t in sw) / len(tokens) for l, sw in STOPWORDS.items()}
+    return max(scores, key=scores.get), scores
+
+
+def check_language(sentences, expected, role):
+    guess, scores = guess_language(sentences)
+    if guess is None or guess == expected:
+        return
+    if expected != "ru" and expected not in scores:
+        return
+    if expected != "ru" and scores.get(guess, 0) < 1.3 * scores.get(expected, 0):
+        return
+    print(f"\nWARNING: the {role} EPUB looks like {LANG_NAMES.get(guess, guess)}, but you chose "
+          f"{LANG_NAMES.get(expected, expected)}. Mixing up the files gives wrong comments.")
+    try:
+        a = input("Continue anyway? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        a = "y"
+    if a not in ("y", "yes"):
+        sys.exit("Stopped. Check which EPUB is which language and run it again.")
+
 
 def ask(prompt, secret=False):
     try:
@@ -308,6 +358,37 @@ def ask(prompt, secret=False):
         return input(prompt).strip()
     except (EOFError, KeyboardInterrupt):
         return ""
+
+
+def choose_language(question, exclude=None):
+    options = [c for c in ("en", "fr", "ru") if c != exclude]
+    print(question)
+    for k, c in enumerate(options, 1):
+        print(f"  {k}) {LANG_NAMES[c]}")
+    while True:
+        a = ask(f"Choose 1-{len(options)} or type a language code [1]: ").lower()
+        if not a:
+            return options[0]
+        if a.isdigit() and 1 <= int(a) <= len(options):
+            return options[int(a) - 1]
+        if a in LANG_NAMES and a != exclude:
+            return a
+        print("Please choose one of the listed languages.")
+
+
+def find_book(lang, role):
+    name = LANG_NAMES.get(lang, lang).lower()
+    for cand in (f"{name}.epub", f"{lang}.epub"):
+        if os.path.exists(cand):
+            print(f"  {role}: using {cand}")
+            return cand
+    for _ in range(3):
+        path = ask(f"Path to the {LANG_NAMES.get(lang, lang)} EPUB ({role}): ")
+        path = os.path.expanduser(path.strip().strip("\"'").replace("\\ ", " "))
+        if path and os.path.exists(path):
+            return path
+        print("File not found.")
+    sys.exit("No EPUB file given.")
 
 
 def choose_level():
@@ -353,60 +434,121 @@ def get_api_key(prov):
         print("The key can't be empty.")
 
 
-# A worked example, so the model copies the exact style of the bracket contents:
-#   fragment (translation; word — meaning; word — meaning; grammar note)
-EXAMPLE_ORIG = (
-    "To Sherlock Holmes she is always THE woman. I have seldom heard him mention her "
-    "under any other name."
-)
-EXAMPLE_JSON = {
-    "items": [{
-        "id": 0,
-        "fragments": [
-            {"src": "To Sherlock Holmes she is always THE woman.",
-             "tr": "для Шерлока Холмса она всегда та самая: «эта» женщина",
-             "words": [], "note": "THE выделено заглавными: «единственная, неповторимая»"},
-            {"src": "I have seldom heard him mention her",
-             "tr": "я редко слышал, /чтобы/ он называл ее",
-             "words": [{"w": "to hear", "tr": "слышать"}, {"w": "to mention", "tr": "называть, упоминать"}],
-             "note": "heard him mention — сложное дополнение: слышал, как он (что-то) делает"},
-            {"src": "under any other name.",
-             "tr": "/под/ каким-либо другим именем", "words": [], "note": ""},
-        ],
-    }]
+def _frag(src, tr, words, note=""):
+    return {"src": src, "tr": tr, "words": [{"w": w, "tr": m} for w, m in words], "note": note}
+
+
+_EN_SRC = ("To Sherlock Holmes she is always THE woman. I have seldom heard him mention her "
+           "under any other name.")
+_FR_SRC = "Je ne l'ai presque jamais entendu la nommer autrement que par son prénom."
+_RU_SRC = "Я почти никогда не слышал, чтобы он называл ее по имени."
+
+EXAMPLES = {
+    ("en", "ru"): (_EN_SRC, [
+        _frag("To Sherlock Holmes she is always THE woman.",
+              "для Шерлока Холмса она всегда та самая: «эта» женщина", [],
+              "THE выделено заглавными: «единственная, неповторимая»"),
+        _frag("I have seldom heard him mention her", "я редко слышал, /чтобы/ он называл ее",
+              [("to hear", "слышать"), ("to mention", "называть, упоминать")],
+              "heard him mention — сложное дополнение: слышал, как он (что-то) делает"),
+        _frag("under any other name.", "/под/ каким-либо другим именем", []),
+    ]),
+    ("en", "fr"): (_EN_SRC, [
+        _frag("To Sherlock Holmes she is always THE woman.",
+              "pour Sherlock Holmes elle est toujours LA femme", [],
+              "THE en majuscules: la seule, l'unique"),
+        _frag("I have seldom heard him mention her", "je l'ai rarement entendu la nommer",
+              [("to hear", "entendre"), ("to mention", "mentionner, nommer")],
+              "heard him mention: verbe de perception + infinitif, comme en français"),
+        _frag("under any other name.", "sous tout autre nom", []),
+    ]),
+    ("fr", "en"): (_FR_SRC, [
+        _frag("Je ne l'ai presque jamais entendu", "I have hardly ever heard him",
+              [("presque jamais", "hardly ever"), ("entendre", "to hear")],
+              "ne ... jamais: negation wraps the verb"),
+        _frag("la nommer", "call her", [("nommer", "to name, to call")],
+              "entendre + infinitive: heard him call her"),
+        _frag("autrement que par son prénom.", "other than by her first name",
+              [("autrement que", "other than"), ("prénom", "first name")]),
+    ]),
+    ("fr", "ru"): (_FR_SRC, [
+        _frag("Je ne l'ai presque jamais entendu", "я почти никогда не слышал, /чтобы/ он",
+              [("presque jamais", "почти никогда"), ("entendre", "слышать")],
+              "ne ... jamais: отрицание обрамляет глагол"),
+        _frag("la nommer", "называл ее", [("nommer", "называть")],
+              "entendu + инфинитив: слышал, как он называет"),
+        _frag("autrement que par son prénom.", "иначе, чем /по/ имени",
+              [("autrement que", "иначе чем"), ("prénom", "имя")]),
+    ]),
+    ("ru", "en"): (_RU_SRC, [
+        _frag("Я почти никогда не слышал,", "I have hardly ever heard",
+              [("почти никогда", "hardly ever"), ("слышать", "to hear")],
+              "не ... никогда: double negation is normal in Russian"),
+        _frag("чтобы он называл ее", "him call her", [("называть", "to call, to name")],
+              "чтобы + past form: clause about what someone does"),
+        _frag("по имени.", "by her first name", [("имя", "name, first name")]),
+    ]),
+    ("ru", "fr"): (_RU_SRC, [
+        _frag("Я почти никогда не слышал,", "je n'ai presque jamais entendu",
+              [("почти никогда", "presque jamais"), ("слышать", "entendre")],
+              "double négation: не ... никогда"),
+        _frag("чтобы он называл ее", "qu'il l'appelle", [("называть", "appeler, nommer")],
+              "чтобы + passé: ici subjonctif en français"),
+        _frag("по имени.", "par son prénom", [("имя", "nom, prénom")]),
+    ]),
 }
 
 
-def system_prompt(level, orig_name, trans_name):
+def _preview(frag):
+    parts = [frag["tr"]] + [f"{w['w']} — {w['tr']}" for w in frag["words"]]
+    if frag["note"]:
+        parts.append(frag["note"])
+    return f"{frag['src']} ({'; '.join(parts)})"
+
+
+def system_prompt(level, orig_name, trans_name, orig_lang=None, trans_lang=None):
     cfg = LEVELS[level]
-    example = json.dumps(EXAMPLE_JSON, ensure_ascii=False)
+    topics = GRAMMAR_TOPICS.get(orig_lang, "")
+    topics_line = f" Typical topics in {orig_name}: {topics}." if topics else ""
+    verb_form = 'Use the infinitive form for verbs (with "to" in English). ' if orig_lang == "en" else "Use the infinitive form for verbs. "
+    example = EXAMPLES.get((orig_lang, trans_lang))
+    if example:
+        ex_src, ex_frags = example
+        ex_json = json.dumps({"items": [{"id": 0, "fragments": ex_frags}]}, ensure_ascii=False)
+        shown = _preview(ex_frags[1])
+        preview_line = f"  {shown}\n"
+        example_line = f"Example. Input src: {ex_src!r}. A good reply:\n{ex_json}\n"
+    else:
+        preview_line = f"  <{orig_name} fragment> (<{trans_name} translation>; <word> — <meaning>; <comment>)\n"
+        example_line = ""
     return (
         f"You prepare {orig_name} text for a {trans_name}-speaking learner at CEFR level {level} ({cfg['desc']}).\n"
         f"You receive a JSON list of items. Each item has: id, src (a {orig_name} sentence or passage) "
         f"and ref (an existing {trans_name} translation of it, possibly empty).\n"
         "For every item, split src into consecutive fragments, in order, covering all of src.\n"
+        f"Languages: src and every \"w\" are {orig_name}. tr, every word meaning and every note are written in "
+        f"{trans_name} only. Never use a third language.\n"
         "The learner will read each fragment followed by a bracket, like this:\n"
-        "  I have seldom heard him mention her (я редко слышал, /чтобы/ он называл ее; to hear — слышать; "
-        "to mention — называть, упоминать; heard him mention — сложное дополнение)\n"
+        f"{preview_line}"
         "so what you write must be a useful, compact reading aid, not a literary translation.\n"
         "Rules:\n"
         "1. Joining all fragment src values with single spaces must reproduce src exactly, character for character, "
         "punctuation included. Never change, drop, reorder or add anything. Copy the characters exactly as given.\n"
         f"2. Use {cfg['fragments']}.\n"
         f"3. tr: a close, literal-leaning {trans_name} rendering of the fragment that lets the learner map the words one to one. "
-        f"Stay close to the wording of ref where it fits. "
+        "Stay close to the wording of ref where it fits. "
         f"Put words that {trans_name} grammar requires but the {orig_name} fragment lacks between slashes, like /word/. "
         "Do not end tr with a comma, full stop or any punctuation. tr must never be empty.\n"
         f"4. words: a list of objects {{\"w\": dictionary form of a word or phrase from the fragment, \"tr\": its short {trans_name} meaning in this context}}. "
-        f"Include: {cfg['gloss']}. Use the infinitive form for verbs (with \"to\" in English). "
+        f"Include: {cfg['gloss']}. {verb_form}"
         f"At most {cfg['max_words']} per fragment, choose the most useful ones. Use an empty list only if the fragment truly has nothing worth glossing.\n"
         f"5. note: an empty string, or one very short comment in {trans_name} (at most 15 words, no full stop at the end) "
-        f"about grammar, an idiom, a nuance or style. At this level, {cfg['note']}. "
+        f"about grammar, an idiom, a nuance or style. At this level, {cfg['note']}.{topics_line} "
         "Name the construction and show it with the words from the fragment, do not just repeat the translation. "
         "Put the note on the fragment where the construction appears. At most one note per item.\n"
         "6. If ref is empty, translate src yourself.\n"
         "7. The id in your reply must be the same integer you received.\n"
-        f"Example. Input src: {EXAMPLE_ORIG!r}. A good reply:\n{example}\n"
+        f"{example_line}"
         "Reply with JSON only, no markdown: "
         "{\"items\":[{\"id\":0,\"fragments\":[{\"src\":\"\",\"tr\":\"\",\"words\":[{\"w\":\"\",\"tr\":\"\"}],\"note\":\"\"}]}]}"
     )
@@ -604,11 +746,6 @@ def _core(s):
 
 
 def _slice_by_core(src, frag_srcs):
-    """Re-cut the ORIGINAL sentence at the places where the model cut it.
-
-    Compares letters and digits only, so the model changing ’ to ' or « » or
-    dropping a non-breaking space no longer invalidates the answer, and the
-    output always keeps the book's real punctuation."""
     contrib = []
     for idx, ch in enumerate(src):
         c = _core(ch)
@@ -680,7 +817,7 @@ def unit_key(model, level, o, t):
     return hashlib.sha1(f"{PROMPT_VERSION}|{model}|{level}|{o}|{t}".encode("utf-8")).hexdigest()
 
 
-def annotate_units(units, key, pool, level, orig_name, trans_name, cache_path, batch, workers):
+def annotate_units(units, key, pool, level, orig_name, trans_name, cache_path, batch, workers, orig_lang=None, trans_lang=None):
     cache = {}
     if cache_path and os.path.exists(cache_path):
         try:
@@ -690,8 +827,8 @@ def annotate_units(units, key, pool, level, orig_name, trans_name, cache_path, b
             cache = {}
 
     lock = threading.Lock()
-    system = system_prompt(level, orig_name, trans_name)
-    tag = pool.tag()
+    system = system_prompt(level, orig_name, trans_name, orig_lang, trans_lang)
+    tag = f"{pool.tag()}|{orig_name}>{trans_name}"
     rounds = max(3, min(len(pool.models), 6))
     pending = [i for i, (o, t) in enumerate(units) if unit_key(tag, level, o, t) not in cache]
     batches = [pending[k:k + batch] for k in range(0, len(pending), batch)]
@@ -792,7 +929,6 @@ def strip_stray_quotes(t):
 
 
 def _piece(s):
-    """Tidy one part of the bracket: no stray quotes, no trailing , ; : . ! ? – """
     s = strip_stray_quotes(" ".join(s.split()))
     return s.rstrip(" ,;:.!?…–—-")
 
@@ -811,7 +947,6 @@ def render_plain(o, t):
 
 
 def render_fragment(fr):
-    """fragment (translation; word — meaning; word — meaning; comment)"""
     src = fr["src"]
     m = _TAIL.search(src)
     body, tail = (src[:m.start()], m.group(1).strip()) if m else (src, "")
@@ -887,13 +1022,17 @@ def build_epub(units, rendered, output_path, orig_lang, title, group=3, ipa=None
     epub.write_epub(output_path, book)
 
 
-def align_books(orig_epub, trans_epub, debug_tsv=None):
+def align_books(orig_epub, trans_epub, debug_tsv=None, orig_lang=None, trans_lang=None):
     print("Step 1: extracting text...")
     orig_sents = blocks_to_sentences(extract_blocks_from_epub(orig_epub))
     trans_sents = blocks_to_sentences(extract_blocks_from_epub(trans_epub))
     print(f"  original: {len(orig_sents)} sentences, translation: {len(trans_sents)} sentences")
     if not orig_sents or not trans_sents:
         sys.exit("Error: one of the books produced no text.")
+    if orig_lang:
+        check_language(orig_sents, orig_lang, "original")
+    if trans_lang:
+        check_language(trans_sents, trans_lang, "translation")
 
     print("Step 2: computing embeddings...")
     model = get_model()
@@ -931,7 +1070,7 @@ def align_books(orig_epub, trans_epub, debug_tsv=None):
 
 def create_book(orig_epub, trans_epub, output_epub, orig_lang, trans_lang, level, key, args):
     print(f"\n[{orig_lang.upper()}] {orig_epub} -> [{trans_lang.upper()}] {trans_epub}, level {level}")
-    units = align_books(orig_epub, trans_epub, args.debug_align)
+    units = align_books(orig_epub, trans_epub, args.debug_align, orig_lang, trans_lang)
     if args.limit:
         units = units[:args.limit]
         print(f"  test mode: only the first {len(units)} units")
@@ -955,6 +1094,7 @@ def create_book(orig_epub, trans_epub, output_epub, orig_lang, trans_lang, level
         units, key, args.pool, level,
         LANG_NAMES.get(orig_lang, orig_lang), LANG_NAMES.get(trans_lang, trans_lang),
         args.cache or output_epub + ".cache.json", args.batch, args.workers,
+        orig_lang, trans_lang,
     )
 
     missing = sum(1 for (o, t), fr in zip(units, annotated) if not fr and not t)
@@ -977,8 +1117,8 @@ def main():
     ap.add_argument("orig", nargs="?")
     ap.add_argument("trans", nargs="?")
     ap.add_argument("out", nargs="?")
-    ap.add_argument("--orig-lang", default="en")
-    ap.add_argument("--trans-lang", default="ru")
+    ap.add_argument("--orig-lang", choices=list(LANG_NAMES), help="language of the book you are learning; asked if omitted")
+    ap.add_argument("--trans-lang", choices=list(LANG_NAMES), help="language of the translation and comments; asked if omitted")
     ap.add_argument("--provider", choices=list(PROVIDERS), help="service to use; asked interactively if omitted")
     ap.add_argument("--base-url", help="custom OpenAI-compatible endpoint, overrides the provider's address")
     ap.add_argument("--level", choices=list(LEVELS), help="reader level; asked interactively if omitted")
@@ -992,6 +1132,13 @@ def main():
     ap.add_argument("--debug-align", metavar="FILE.tsv", help="write the sentence alignment to a TSV")
     args = ap.parse_args()
 
+    orig_lang = args.orig_lang or choose_language("Language of the book you are learning (the original text):")
+    trans_lang = args.trans_lang or choose_language("Language of your translation and comments:", exclude=orig_lang)
+    if orig_lang == trans_lang:
+        sys.exit("The two languages must be different.")
+    orig_path = args.orig or find_book(orig_lang, "original")
+    trans_path = args.trans or find_book(trans_lang, "translation")
+
     level = args.level or choose_level()
     args.provider = args.provider or choose_provider()
     prov = PROVIDERS[args.provider]
@@ -1003,21 +1150,8 @@ def main():
     if args.workers is None:
         args.workers = 1
 
-    if args.orig and args.trans:
-        out = args.out or f"{args.orig_lang}_{args.trans_lang}_{level}_frank.epub"
-        create_book(args.orig, args.trans, out, args.orig_lang, args.trans_lang, level, key, args)
-        return
-
-    names = {"en": "english.epub", "fr": "french.epub", "ru": "russian.epub"}
-    done = False
-    for o, t in (("fr", "ru"), ("en", "ru"), ("fr", "en")):
-        if os.path.exists(names[o]) and os.path.exists(names[t]):
-            out = f"{names[o][:-5]}_{names[t][:-5]}_{level}_frank.epub"
-            create_book(names[o], names[t], out, o, t, level, key, args)
-            done = True
-    if not done:
-        print("Could not find a valid pair. Name files english.epub / french.epub / russian.epub "
-              "or pass paths explicitly.")
+    out = args.out or f"{orig_lang}_{trans_lang}_{level}_frank.epub"
+    create_book(orig_path, trans_path, out, orig_lang, trans_lang, level, key, args)
 
 
 if __name__ == "__main__":
